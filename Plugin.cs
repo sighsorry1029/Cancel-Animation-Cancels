@@ -2,12 +2,10 @@
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Timers;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
-using JetBrains.Annotations;
 using ServerSync;
 using UnityEngine;
 
@@ -16,17 +14,16 @@ namespace ServerSyncModTemplate;
 [BepInPlugin(ModGUID, ModName, ModVersion)]
 public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 {
-    internal const string ModName = "ServerSyncModTemplate";
-    internal const string ModVersion = "1.0.0";
-    internal const string Author = "{Azumatt}";
-    private const string ModGUID = $"{Author}.{ModName}";
+    internal const string ModName = "CancelAnimationCancels";
+    internal const string ModVersion = "1.0.2";
+    internal const string Author = "sighsorry";
+    private const string ModGUID = "sighsorry.CancelAnimationCancel";
     private static string ConfigFileName = $"{ModGUID}.cfg";
     private static string ConfigFileFullPath = Paths.ConfigPath + Path.DirectorySeparatorChar + ConfigFileName;
-    internal static string ConnectionError = "";
     private readonly Harmony _harmony = new(ModGUID);
     public static readonly ManualLogSource ServerSyncModTemplateLogger = BepInEx.Logging.Logger.CreateLogSource(ModName);
-    private static readonly ConfigSync ConfigSync = new(ModGUID) { DisplayName = ModName, CurrentVersion = ModVersion, MinimumRequiredVersion = ModVersion };
-    private FileSystemWatcher _watcher;
+    private static readonly ConfigSync ConfigSync = new(ModGUID) { DisplayName = ModName, CurrentVersion = ModVersion, MinimumRequiredVersion = ModVersion, ModRequired = true };
+    private FileSystemWatcher? _watcher;
     private readonly object _reloadLock = new();
     private DateTime _lastConfigReloadTime;
     private const long RELOAD_DELAY = 10000000; // One second
@@ -42,20 +39,23 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
         bool saveOnSet = Config.SaveOnConfigSet;
         Config.SaveOnConfigSet = false;
 
-        // Uncomment the line below to use the LocalizationManager for localizing your mod.
-        // Make sure to populate the English.yml file in the translation folder with your keys to be localized and the values associated before uncommenting!.
-        //Localizer.Load(); // Use this to initialize the LocalizationManager (for more information on LocalizationManager, see the LocalizationManager documentation https://github.com/blaxxun-boop/LocalizationManager#example-project).
+        try
+        {
+            _serverConfigLocked = config("1 - General", "Lock Configuration", Toggle.On, "If on, the configuration is locked and can be changed by server admins only.");
+            _ = ConfigSync.AddLockingConfigEntry(_serverConfigLocked);
+            PreventBlockComboCarry = config("1 - General", "Prevent Block Combo Carry", Toggle.On, "If on, one-handed swords, knives, and one-handed clubs will lose combo carry when block is used between attacks.");
+            PreventEmoteCancel = config("1 - General", "Prevent Emote Cancel", Toggle.On, "If on, recent attacks from affected weapons cannot be canceled into emotes, and combo carry will be reset if an emote still slips through.");
+            BlockEmoteConsoleBinds = config("1 - General", "Block Emote Console Binds", Toggle.Off, "If on, console bind commands cannot assign emotes, and existing emote binds are disabled until this is turned off.");
+            PreventDodgeAttackQueue = config("1 - General", "Prevent Dodge Attack Queue", Toggle.On, "If on, unarmed, spears, axes, battleaxes, and atgeirs will lose queued attacks and combo carry when a dodge starts, and dodge-cancel attack input will be blocked.");
+            BlockEmoteConsoleBinds.SettingChanged += (_, _) => ComboChainResetPatches.RefreshConsoleBinds();
 
-        _serverConfigLocked = config("1 - General", "Lock Configuration", Toggle.On, "If on, the configuration is locked and can be changed by server admins only.");
-        _ = ConfigSync.AddLockingConfigEntry(_serverConfigLocked);
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            _harmony.PatchAll(assembly);
+            SetupWatcher();
 
-
-        Assembly assembly = Assembly.GetExecutingAssembly();
-        _harmony.PatchAll(assembly);
-        SetupWatcher();
-
-        Config.Save();
-        if (saveOnSet)
+            Config.Save();
+        }
+        finally
         {
             Config.SaveOnConfigSet = saveOnSet;
         }
@@ -63,8 +63,14 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 
     private void OnDestroy()
     {
-        SaveWithRespectToConfigSet();
-        _watcher?.Dispose();
+        try
+        {
+            SaveWithRespectToConfigSet();
+        }
+        finally
+        {
+            _watcher?.Dispose();
+        }
     }
 
     private void SetupWatcher()
@@ -114,32 +120,34 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
     {
         bool originalSaveOnSet = Config.SaveOnConfigSet;
         Config.SaveOnConfigSet = false;
-        if (reload)
-            Config.Reload();
-        Config.Save();
-        if (originalSaveOnSet)
+        try
+        {
+            if (reload)
+            {
+                Config.Reload();
+            }
+
+            Config.Save();
+        }
+        finally
         {
             Config.SaveOnConfigSet = originalSaveOnSet;
         }
-        
-        // If you want to do something once localization completes, LocalizationManager has a hook for that.
-        /*Localizer.OnLocalizationComplete += () =>
-        {
-            // Do something
-            ItemManagerModTemplateLogger.LogDebug("OnLocalizationComplete called");
-        };*/
     }
 
 
     #region ConfigOptions
 
     private static ConfigEntry<Toggle> _serverConfigLocked = null!;
+    internal static ConfigEntry<Toggle> PreventBlockComboCarry = null!;
+    internal static ConfigEntry<Toggle> PreventEmoteCancel = null!;
+    internal static ConfigEntry<Toggle> BlockEmoteConsoleBinds = null!;
+    internal static ConfigEntry<Toggle> PreventDodgeAttackQueue = null!;
 
     private ConfigEntry<T> config<T>(string group, string name, T value, ConfigDescription description, bool synchronizedSetting = true)
     {
         ConfigDescription extendedDescription = new(description.Description + (synchronizedSetting ? " [Synced with Server]" : " [Not Synced with Server]"), description.AcceptableValues, description.Tags);
         ConfigEntry<T> configEntry = Config.Bind(group, name, value, extendedDescription);
-        //var configEntry = Config.Bind(group, name, value, description);
 
         SyncedConfigEntry<T> syncedConfigEntry = ConfigSync.AddConfigEntry(configEntry);
         syncedConfigEntry.SynchronizedConfig = synchronizedSetting;
@@ -150,22 +158,6 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
     private ConfigEntry<T> config<T>(string group, string name, T value, string description, bool synchronizedSetting = true)
     {
         return config(group, name, value, new ConfigDescription(description), synchronizedSetting);
-    }
-
-    private class ConfigurationManagerAttributes
-    {
-        [UsedImplicitly] public int? Order = null!;
-        [UsedImplicitly] public bool? Browsable = null!;
-        [UsedImplicitly] public string? Category = null!;
-        [UsedImplicitly] public Action<ConfigEntryBase>? CustomDrawer = null!;
-    }
-
-    class AcceptableShortcuts() : AcceptableValueBase(typeof(KeyboardShortcut))
-    {
-        public override object Clamp(object value) => value;
-        public override bool IsValid(object value) => true;
-
-        public override string ToDescriptionString() => $"# Acceptable values: {string.Join(", ", UnityInput.Current.SupportedKeyCodes)}";
     }
 
     #endregion
